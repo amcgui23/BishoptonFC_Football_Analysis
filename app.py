@@ -95,10 +95,48 @@ COACH NOTES:
 
 
 def get_api_key():
+    """Return the Gemini key exactly as configured, with harmless copy/paste cleanup.
+
+    Google is transitioning AI Studio keys from Standard keys to Authorization (AQ.)
+    keys. The current google-genai SDK accepts an explicit API key, so we pass the
+    cleaned value directly to genai.Client rather than relying on environment-variable
+    precedence. This also avoids accidentally selecting an old GOOGLE_API_KEY.
+    """
+    value = None
     try:
-        return st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        value = st.secrets.get("GEMINI_API_KEY")
     except Exception:
-        return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        pass
+    if not value:
+        value = os.getenv("GEMINI_API_KEY")
+    if not value:
+        value = os.getenv("GOOGLE_API_KEY")
+    if not value:
+        return None
+
+    # Make the app tolerant of a key copied with whitespace or accidental wrapping quotes.
+    value = str(value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'\"', "'"}:
+        value = value[1:-1].strip()
+    return value
+
+
+def validate_api_key_format(api_key: str):
+    """Give a useful message without exposing the secret."""
+    if not api_key:
+        raise RuntimeError(
+            "No Gemini API key configured. In Streamlit Secrets, add GEMINI_API_KEY = \"AQ....\"."
+        )
+
+    # AI Studio now creates Authorization keys beginning with AQ. Standard keys may
+    # still exist if explicitly restricted. Do not reject either format locally; let
+    # Google's API determine whether the key is active/linked.
+    if api_key.startswith("AQ."):
+        return "auth"
+    if api_key.startswith("AIza"):
+        return "standard"
+    # Keep this permissive because Google can change key prefixes without notice.
+    return "other"
 
 
 def extract_json(text: str):
@@ -120,8 +158,7 @@ def build_prompt(roster: str, notes: str):
 
 def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
     api_key = get_api_key()
-    if not api_key:
-        raise RuntimeError("No Gemini API key configured. Add GEMINI_API_KEY to Streamlit Secrets.")
+    validate_api_key_format(api_key)
 
     # Gemini's current Interactions API accepts public YouTube URLs directly,
     # so the match does not need to be downloaded through Streamlit first.
@@ -142,8 +179,7 @@ def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
 
 def analyse_video(path: str, roster: str, notes: str, model_name: str):
     api_key = get_api_key()
-    if not api_key:
-        raise RuntimeError("No Gemini API key configured. Add GEMINI_API_KEY to Streamlit Secrets.")
+    validate_api_key_format(api_key)
 
     client = genai.Client(api_key=api_key)
     uploaded = client.files.upload(file=path)
@@ -232,6 +268,7 @@ with st.sidebar:
         placeholder="Example: assess build-up from the goalkeeper, pressing after losing the ball, and midfield spacing.",
     )
     st.info("For best results, provide shirt numbers and upload the clearest match footage available.")
+    st.caption("Gemini API keys created in AI Studio may begin with AQ. — that is supported. Keep the key in Streamlit Secrets and never commit it to GitHub.")
 
 st.subheader("Choose your video source")
 source = st.radio(
