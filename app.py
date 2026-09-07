@@ -3,6 +3,7 @@ import os
 import re
 import tempfile
 import time
+import requests
 from pathlib import Path
 
 import streamlit as st
@@ -156,11 +157,68 @@ def build_prompt(roster: str, notes: str):
     )
 
 
-def _wait_for_background_interaction(client, interaction, label="Gemini analysis", max_wait_seconds=3600):
-    """Poll a Gemini background interaction without holding one long API request open."""
+def _interaction_headers(api_key: str):
+    return {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+        "Api-Revision": "2026-05-20",
+    }
+
+
+def _extract_interaction_output(data):
+    steps = data.get("steps") or []
+    texts = []
+    for step in steps:
+        if step.get("type") != "model_output":
+            continue
+        for content in step.get("content") or []:
+            if content.get("type") == "text" and content.get("text"):
+                texts.append(content["text"])
+    if texts:
+        return "\n".join(texts)
+    raise RuntimeError("Gemini completed the interaction but returned no model text.")
+
+
+def _raise_google_error(response, action):
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"raw": response.text[:2000]}
+    err = payload.get("error", {}) if isinstance(payload, dict) else {}
+    code = err.get("code") or response.status_code
+    status = err.get("status", "")
+    message = err.get("message") or response.text[:2000]
+    raise RuntimeError(f"Gemini {action} failed: HTTP {code} {status} — {message}")
+
+
+def _create_background_interaction(api_key, model_name, inputs):
+    # Use the documented REST Interactions API directly for the long-video path.
+    # This avoids SDK-version serialization differences around the new processing
+    # and background fields while keeping the exact Google API request shape.
+    payload = {
+        "model": model_name,
+        "input": inputs,
+        "background": True,
+    }
+    response = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        headers=_interaction_headers(api_key),
+        json=payload,
+        timeout=60,
+    )
+    if not response.ok:
+        _raise_google_error(response, "interaction creation")
+    data = response.json()
+    if not data.get("id"):
+        raise RuntimeError(f"Gemini returned an unexpected interaction response: {data}")
+    return data
+
+
+def _wait_for_background_interaction(api_key, interaction, label="Gemini analysis", max_wait_seconds=3600):
+    """Poll a Gemini background interaction over REST without one long HTTP request."""
     started = time.time()
     progress = st.progress(0, text=f"{label} started in Gemini…")
-    interaction_id = getattr(interaction, "id", None)
+    interaction_id = interaction.get("id")
     if not interaction_id:
         raise RuntimeError("Gemini did not return a background interaction ID.")
 
@@ -173,8 +231,15 @@ def _wait_for_background_interaction(client, interaction, label="Gemini analysis
                 f"The background job may continue on Google's servers (interaction {interaction_id})."
             )
 
-        current = client.interactions.get(interaction_id)
-        status = getattr(current, "status", None)
+        response = requests.get(
+            f"https://generativelanguage.googleapis.com/v1beta/interactions/{interaction_id}",
+            headers=_interaction_headers(api_key),
+            timeout=60,
+        )
+        if not response.ok:
+            _raise_google_error(response, "interaction polling")
+        current = response.json()
+        status = current.get("status")
         if status != last_status:
             progress.progress(
                 min(95, max(5, int((elapsed / max_wait_seconds) * 90))),
@@ -183,15 +248,13 @@ def _wait_for_background_interaction(client, interaction, label="Gemini analysis
             last_status = status
 
         if status == "completed":
-            output_text = getattr(current, "output_text", None)
-            if not output_text:
-                raise RuntimeError("Gemini completed the background job but returned no analysis text.")
+            output_text = _extract_interaction_output(current)
             progress.progress(100, text="Analysis complete")
             return extract_json(output_text)
 
         if status in {"failed", "cancelled"}:
-            error = getattr(current, "error", None)
-            raise RuntimeError(f"Gemini background analysis {status}: {error or 'no error details returned'}")
+            error = current.get("error") or "no error details returned"
+            raise RuntimeError(f"Gemini background analysis {status}: {error}")
 
         time.sleep(5)
 
@@ -199,25 +262,23 @@ def _wait_for_background_interaction(client, interaction, label="Gemini analysis
 def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
     api_key = get_api_key()
     validate_api_key_format(api_key)
-
-    # Long football matches can exceed the normal synchronous HTTP deadline.
-    # Gemini's current Interactions API supports background execution and agentic
-    # video processing, which is specifically intended for long-form video.
-    client = genai.Client(api_key=api_key)
     prompt = build_prompt(roster, notes)
-    interaction = client.interactions.create(
-        model=model_name,
-        input=[
-            {"type": "text", "text": prompt},
-            {
-                "type": "video",
-                "uri": url.strip(),
-                "processing": "agentic",
-            },
-        ],
-        background=True,
-    )
-    return _wait_for_background_interaction(client, interaction, label="YouTube match analysis")
+    try:
+        interaction = _create_background_interaction(
+            api_key,
+            model_name,
+            [
+                {
+                    "type": "video",
+                    "uri": url.strip(),
+                    "processing": "agentic",
+                },
+                {"type": "text", "text": prompt},
+            ],
+        )
+    except Exception as exc:
+        raise RuntimeError(f"YouTube request was rejected by Gemini: {exc}") from exc
+    return _wait_for_background_interaction(api_key, interaction, label="YouTube match analysis")
 
 
 def analyse_video(path: str, roster: str, notes: str, model_name: str):
@@ -239,11 +300,10 @@ def analyse_video(path: str, roster: str, notes: str, model_name: str):
     prompt = build_prompt(roster, notes)
     progress.progress(35, text="Starting long-video analysis…")
 
-    # Use the same Interactions API/background/agentic path for uploaded long-form
-    # matches. This avoids a single long synchronous GenerateContent request.
-    interaction = client.interactions.create(
-        model=model_name,
-        input=[
+    interaction = _create_background_interaction(
+        api_key,
+        model_name,
+        [
             {
                 "type": "video",
                 "uri": uploaded.uri,
@@ -252,9 +312,8 @@ def analyse_video(path: str, roster: str, notes: str, model_name: str):
             },
             {"type": "text", "text": prompt},
         ],
-        background=True,
     )
-    return _wait_for_background_interaction(client, interaction, label="Uploaded match analysis")
+    return _wait_for_background_interaction(api_key, interaction, label="Uploaded match analysis")
 
 
 def rating_label(r):
