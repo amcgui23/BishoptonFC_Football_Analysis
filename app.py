@@ -112,6 +112,34 @@ def extract_json(text: str):
         raise
 
 
+def build_prompt(roster: str, notes: str):
+    return PROMPT.replace("{{ROSTER}}", roster or "No roster supplied.").replace(
+        "{{NOTES}}", notes or "No additional notes supplied."
+    )
+
+
+def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
+    api_key = get_api_key()
+    if not api_key:
+        raise RuntimeError("No Gemini API key configured. Add GEMINI_API_KEY to Streamlit Secrets.")
+
+    # Gemini's current Interactions API accepts public YouTube URLs directly,
+    # so the match does not need to be downloaded through Streamlit first.
+    client = genai.Client(api_key=api_key)
+    prompt = build_prompt(roster, notes)
+    response = client.interactions.create(
+        model=model_name,
+        input=[
+            {"type": "text", "text": prompt},
+            {"type": "video", "uri": url.strip()},
+        ],
+    )
+    output_text = getattr(response, "output_text", None)
+    if not output_text:
+        raise RuntimeError("Gemini returned no analysis text for the YouTube video.")
+    return extract_json(output_text)
+
+
 def analyse_video(path: str, roster: str, notes: str, model_name: str):
     api_key = get_api_key()
     if not api_key:
@@ -129,7 +157,7 @@ def analyse_video(path: str, roster: str, notes: str, model_name: str):
     if uploaded.state.name == "FAILED":
         raise RuntimeError("Gemini could not process the uploaded video.")
 
-    prompt = PROMPT.replace("{{ROSTER}}", roster or "No roster supplied.").replace("{{NOTES}}", notes or "No additional notes supplied.")
+    prompt = build_prompt(roster, notes)
     progress.progress(35, text="Analysing match footage…")
 
     response = client.models.generate_content(
@@ -205,45 +233,85 @@ with st.sidebar:
     )
     st.info("For best results, provide shirt numbers and upload the clearest match footage available.")
 
-uploaded_file = st.file_uploader(
-    "Upload your match video",
-    type=["mp4", "mov", "m4v", "avi", "webm"],
-    max_upload_size=3072,
-    help="Uploads up to 3 GB are accepted by the app. Gemini File API currently supports up to 2 GB per file, so files above 2 GB will be rejected with a clear message.",
+st.subheader("Choose your video source")
+source = st.radio(
+    "Video source",
+    ["YouTube link", "Upload video"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
 
-if uploaded_file:
-    st.video(uploaded_file)
-    size_mb = uploaded_file.size / (1024 * 1024)
-    st.caption(f"{uploaded_file.name} · {size_mb:.1f} MB")
-    if size_mb > MAX_GEMINI_MB:
-        st.warning(
-            f"This video is {size_mb/1024:.2f} GB. The app accepts files up to 3 GB, "
-            "but Gemini's File API currently limits an individual file to 2 GB. "
-            "Please export/compress the video to 2 GB or less before analysing it."
-        )
+if source == "YouTube link":
+    youtube_url = st.text_input(
+        "YouTube match link",
+        placeholder="https://www.youtube.com/watch?v=...",
+        help="Use a public YouTube video. Private and unlisted videos cannot be analysed by Gemini's YouTube input.",
+    )
+    st.info("💡 For a large full-match recording, YouTube is often the easiest option because the video does not need to be uploaded through this app.")
 
-    if st.button("🔎 Analyse Match", type="primary", use_container_width=True, disabled=size_mb > MAX_GEMINI_MB):
-        suffix = Path(uploaded_file.name).suffix.lower() or ".mp4"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded_file.getbuffer())
-            temp_path = tmp.name
-        try:
-            with st.spinner("Preparing the match analysis…"):
-                result = analyse_video(temp_path, roster, notes, model_name)
-            st.session_state["analysis"] = result
-        except Exception as exc:
-            st.error(f"Analysis failed: {exc}")
-        finally:
+    if youtube_url:
+        is_youtube = bool(re.match(r"^https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[^\s&]+", youtube_url.strip(), re.IGNORECASE))
+        if not is_youtube:
+            st.warning("That doesn't look like a standard YouTube video link. Paste a link such as https://www.youtube.com/watch?v=... .")
+
+        if st.button("🔎 Analyse YouTube Match", type="primary", use_container_width=True, disabled=not is_youtube):
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+                with st.spinner("Sending the YouTube match to Gemini for analysis…"):
+                    result = analyse_youtube(youtube_url, roster, notes, model_name)
+                st.session_state["analysis"] = result
+                st.session_state["analysis_source"] = youtube_url.strip()
+                st.rerun()
+            except Exception as exc:
+                st.error(f"YouTube analysis failed: {exc}")
+                st.caption("Check that the video is public, the URL is correct, and your Gemini API key/model has access to the current YouTube video feature.")
+    else:
+        st.markdown("**YouTube requirements:** public video, valid YouTube URL, and a Gemini API key in Streamlit Secrets.")
+
+else:
+    uploaded_file = st.file_uploader(
+        "Upload your match video",
+        type=["mp4", "mov", "m4v", "avi", "webm"],
+        max_upload_size=MAX_UPLOAD_MB,
+        help="Uploads up to 3 GB are accepted by the app. Gemini File API currently supports up to 2 GB per file, so files above 2 GB will be rejected with a clear message.",
+    )
+
+    if uploaded_file:
+        st.video(uploaded_file)
+        size_mb = uploaded_file.size / (1024 * 1024)
+        st.caption(f"{uploaded_file.name} · {size_mb:.1f} MB")
+        if size_mb > MAX_GEMINI_MB:
+            st.warning(
+                f"This video is {size_mb/1024:.2f} GB. The app accepts files up to 3 GB, "
+                "but Gemini's File API currently limits an individual file to 2 GB. "
+                "Please export/compress the video to 2 GB or less before analysing it."
+            )
+
+        if st.button("🔎 Analyse Match", type="primary", use_container_width=True, disabled=size_mb > MAX_GEMINI_MB):
+            suffix = Path(uploaded_file.name).suffix.lower() or ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(uploaded_file.getbuffer())
+                temp_path = tmp.name
+            try:
+                with st.spinner("Preparing the match analysis…"):
+                    result = analyse_video(temp_path, roster, notes, model_name)
+                st.session_state["analysis"] = result
+                st.session_state["analysis_source"] = uploaded_file.name
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Analysis failed: {exc}")
+            finally:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
 result = st.session_state.get("analysis")
 if result:
     st.divider()
     match = result.get("match", {})
+    source_label = st.session_state.get("analysis_source")
+    if source_label:
+        st.caption(f"Video source: {source_label}")
     tabs = st.tabs(["📋 Match report", "👤 Players", "📊 Statistics", "🎯 Key moments", "🧠 Coach report", "🧾 Raw JSON"])
 
     with tabs[0]:
@@ -316,5 +384,6 @@ if result:
     )
 else:
     st.markdown("### How to use it")
-    st.write("1. Add your squad with shirt numbers in the sidebar.  2. Upload the match video.  3. Add any coaching focus.  4. Tap **Analyse Match**.")
+    st.write("1. Add your squad with shirt numbers in the sidebar.  2. Choose **YouTube link** or **Upload video**.  3. Add any coaching focus.  4. Tap the analysis button.")
+    st.info("For large full-match recordings, uploading the match to YouTube and using the YouTube link can be easier than uploading the MP4 directly.")
     st.info("This is an AI-assisted analysis tool. It should support coaching decisions, not replace a coach's own review of the footage.")
