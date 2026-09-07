@@ -12,7 +12,10 @@ from google.genai import types
 
 st.set_page_config(page_title="Bishopton FC Video Analyst", page_icon="⚽", layout="wide")
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash"]
+MAX_CREATE_RETRIES = 5
+MAX_POLL_RETRIES = 8
 MAX_UPLOAD_MB = 3072
 MAX_GEMINI_MB = 2048
 
@@ -191,31 +194,67 @@ def _raise_google_error(response, action):
     raise RuntimeError(f"Gemini {action} failed: HTTP {code} {status} — {message}")
 
 
+def _is_retryable_http(status_code: int, message: str = ""):
+    msg = (message or "").lower()
+    return status_code in {429, 500, 502, 503, 504} or "high demand" in msg or "spikes in demand" in msg
+
+
+def _backoff(attempt: int):
+    # 2, 4, 8, 16, 30 seconds, capped to keep retries practical on Streamlit.
+    return min(30, 2 ** attempt)
+
+
 def _create_background_interaction(api_key, model_name, inputs):
-    # Use the documented REST Interactions API directly for the long-video path.
-    # This avoids SDK-version serialization differences around the new processing
-    # and background fields while keeping the exact Google API request shape.
     payload = {
         "model": model_name,
         "input": inputs,
         "background": True,
     }
-    response = requests.post(
-        "https://generativelanguage.googleapis.com/v1beta/interactions",
-        headers=_interaction_headers(api_key),
-        json=payload,
-        timeout=60,
-    )
-    if not response.ok:
-        _raise_google_error(response, "interaction creation")
-    data = response.json()
-    if not data.get("id"):
-        raise RuntimeError(f"Gemini returned an unexpected interaction response: {data}")
-    return data
+    last_error = None
+    for attempt in range(MAX_CREATE_RETRIES):
+        try:
+            response = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/interactions",
+                headers=_interaction_headers(api_key),
+                json=payload,
+                timeout=60,
+            )
+            if response.ok:
+                data = response.json()
+                if not data.get("id"):
+                    raise RuntimeError(f"Gemini returned an unexpected interaction response: {data}")
+                return data
+            try:
+                err_payload = response.json()
+            except Exception:
+                err_payload = {"raw": response.text[:2000]}
+            err = err_payload.get("error", {}) if isinstance(err_payload, dict) else {}
+            message = err.get("message") or response.text[:2000]
+            last_error = RuntimeError(
+                f"Gemini interaction creation failed: HTTP {err.get('code') or response.status_code} "
+                f"{err.get('status','')} — {message}"
+            )
+            if not _is_retryable_http(response.status_code, message) or attempt == MAX_CREATE_RETRIES - 1:
+                raise last_error
+            wait = _backoff(attempt)
+            st.info(f"Gemini is busy ({model_name}). Retrying automatically in {wait}s…")
+            time.sleep(wait)
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == MAX_CREATE_RETRIES - 1:
+                raise RuntimeError(f"Could not reach Gemini after {MAX_CREATE_RETRIES} attempts: {exc}") from exc
+            wait = _backoff(attempt)
+            st.info(f"Temporary connection problem. Retrying in {wait}s…")
+            time.sleep(wait)
+    raise last_error or RuntimeError("Gemini interaction creation failed.")
+
+
+class GeminiHighDemandError(RuntimeError):
+    pass
 
 
 def _wait_for_background_interaction(api_key, interaction, label="Gemini analysis", max_wait_seconds=3600):
-    """Poll a Gemini background interaction over REST without one long HTTP request."""
+    """Poll a Gemini background interaction, retrying temporary/high-demand errors."""
     started = time.time()
     progress = st.progress(0, text=f"{label} started in Gemini…")
     interaction_id = interaction.get("id")
@@ -223,6 +262,7 @@ def _wait_for_background_interaction(api_key, interaction, label="Gemini analysi
         raise RuntimeError("Gemini did not return a background interaction ID.")
 
     last_status = None
+    poll_failures = 0
     while True:
         elapsed = int(time.time() - started)
         if elapsed > max_wait_seconds:
@@ -231,43 +271,95 @@ def _wait_for_background_interaction(api_key, interaction, label="Gemini analysi
                 f"The background job may continue on Google's servers (interaction {interaction_id})."
             )
 
-        response = requests.get(
-            f"https://generativelanguage.googleapis.com/v1beta/interactions/{interaction_id}",
-            headers=_interaction_headers(api_key),
-            timeout=60,
-        )
-        if not response.ok:
-            _raise_google_error(response, "interaction polling")
-        current = response.json()
-        status = current.get("status")
-        if status != last_status:
+        try:
+            response = requests.get(
+                f"https://generativelanguage.googleapis.com/v1beta/interactions/{interaction_id}",
+                headers=_interaction_headers(api_key),
+                timeout=60,
+            )
+            if not response.ok:
+                try:
+                    payload = response.json()
+                except Exception:
+                    payload = {}
+                err = payload.get("error", {}) if isinstance(payload, dict) else {}
+                message = err.get("message") or response.text[:2000]
+                if _is_retryable_http(response.status_code, message) and poll_failures < MAX_POLL_RETRIES:
+                    wait = _backoff(min(poll_failures, 4))
+                    poll_failures += 1
+                    progress.progress(
+                        min(95, max(5, int((elapsed / max_wait_seconds) * 90))),
+                        text=f"Gemini is busy while checking the analysis. Retrying in {wait}s…",
+                    )
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(
+                    f"Gemini interaction polling failed: HTTP {err.get('code') or response.status_code} "
+                    f"{err.get('status','')} — {message}"
+                )
+            poll_failures = 0
+            current = response.json()
+            status = current.get("status")
+            if status != last_status:
+                progress.progress(
+                    min(95, max(5, int((elapsed / max_wait_seconds) * 90))),
+                    text=f"{label} — Gemini status: {status or 'in progress'}…",
+                )
+                last_status = status
+
+            if status == "completed":
+                output_text = _extract_interaction_output(current)
+                progress.progress(100, text="Analysis complete")
+                return extract_json(output_text)
+
+            if status in {"failed", "cancelled"}:
+                error = current.get("error") or "no error details returned"
+                error_text = json.dumps(error) if isinstance(error, dict) else str(error)
+                if "high demand" in error_text.lower() or "spikes in demand" in error_text.lower():
+                    raise GeminiHighDemandError(f"Gemini reported high demand: {error_text}")
+                raise RuntimeError(f"Gemini background analysis {status}: {error_text}")
+
+            time.sleep(5)
+        except requests.RequestException as exc:
+            if poll_failures >= MAX_POLL_RETRIES:
+                raise RuntimeError(f"Gemini polling connection failed after retries: {exc}") from exc
+            wait = _backoff(min(poll_failures, 4))
+            poll_failures += 1
             progress.progress(
                 min(95, max(5, int((elapsed / max_wait_seconds) * 90))),
-                text=f"{label} — Gemini status: {status or 'in progress'}…",
+                text=f"Temporary polling connection problem. Retrying in {wait}s…",
             )
-            last_status = status
+            time.sleep(wait)
 
-        if status == "completed":
-            output_text = _extract_interaction_output(current)
-            progress.progress(100, text="Analysis complete")
-            return extract_json(output_text)
 
-        if status in {"failed", "cancelled"}:
-            error = current.get("error") or "no error details returned"
-            raise RuntimeError(f"Gemini background analysis {status}: {error}")
+def _analyse_with_model_fallback(api_key, inputs_factory, preferred_model):
+    models = []
+    for model in [preferred_model, *FALLBACK_MODELS]:
+        if model and model not in models:
+            models.append(model)
 
-        time.sleep(5)
-
+    last_error = None
+    for index, model in enumerate(models):
+        try:
+            st.caption(f"Gemini model: {model}")
+            interaction = _create_background_interaction(api_key, model, inputs_factory())
+            return _wait_for_background_interaction(api_key, interaction, label=f"{model} match analysis")
+        except GeminiHighDemandError as exc:
+            last_error = exc
+            if index < len(models) - 1:
+                st.warning(f"{model} is currently under heavy demand. Trying {models[index + 1]} automatically…")
+                continue
+            raise
+    raise last_error or RuntimeError("No Gemini model was available for the analysis.")
 
 def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
     api_key = get_api_key()
     validate_api_key_format(api_key)
     prompt = build_prompt(roster, notes)
     try:
-        interaction = _create_background_interaction(
+        return _analyse_with_model_fallback(
             api_key,
-            model_name,
-            [
+            lambda: [
                 {
                     "type": "video",
                     "uri": url.strip(),
@@ -275,10 +367,10 @@ def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
                 },
                 {"type": "text", "text": prompt},
             ],
+            model_name,
         )
     except Exception as exc:
-        raise RuntimeError(f"YouTube request was rejected by Gemini: {exc}") from exc
-    return _wait_for_background_interaction(api_key, interaction, label="YouTube match analysis")
+        raise RuntimeError(f"YouTube analysis failed: {exc}") from exc
 
 
 def analyse_video(path: str, roster: str, notes: str, model_name: str):
@@ -299,22 +391,22 @@ def analyse_video(path: str, roster: str, notes: str, model_name: str):
 
     prompt = build_prompt(roster, notes)
     progress.progress(35, text="Starting long-video analysis…")
-
-    interaction = _create_background_interaction(
-        api_key,
-        model_name,
-        [
-            {
-                "type": "video",
-                "uri": uploaded.uri,
-                "mime_type": uploaded.mime_type,
-                "processing": "agentic",
-            },
-            {"type": "text", "text": prompt},
-        ],
-    )
-    return _wait_for_background_interaction(api_key, interaction, label="Uploaded match analysis")
-
+    try:
+        return _analyse_with_model_fallback(
+            api_key,
+            lambda: [
+                {
+                    "type": "video",
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "processing": "agentic",
+                },
+                {"type": "text", "text": prompt},
+            ],
+            model_name,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Uploaded video analysis failed: {exc}") from exc
 
 def rating_label(r):
     if r is None:
@@ -363,7 +455,7 @@ st.caption("AI-assisted match review for grassroots coaching — designed to wor
 
 with st.sidebar:
     st.header("Match setup")
-    model_name = st.text_input("Gemini model", value=MODEL_NAME, help="Default is Gemini 3.7 Flash. Change only if you know the model is available to your API key.")
+    model_name = st.text_input("Gemini model", value=MODEL_NAME, help="Default is Gemini 3.8 Flash. If it is temporarily busy, the app automatically retries and can fall back to Gemini 3.7 Flash.")
     roster = st.text_area(
         "Optional squad / roster",
         height=180,
@@ -376,7 +468,7 @@ with st.sidebar:
         placeholder="Example: assess build-up from the goalkeeper, pressing after losing the ball, and midfield spacing.",
     )
     st.info("For best results, provide shirt numbers and upload the clearest match footage available.")
-    st.caption("Gemini API keys created in AI Studio may begin with AQ. — that is supported. Keep the key in Streamlit Secrets and never commit it to GitHub.")
+    st.caption("Gemini API keys created in AI Studio may begin with AQ. — that is supported. Long-video analysis uses agentic processing with automatic retry/backoff and a 3.7 Flash fallback.")
 
 st.subheader("Choose your video source")
 source = st.radio(
