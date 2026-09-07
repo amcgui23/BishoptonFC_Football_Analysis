@@ -156,25 +156,68 @@ def build_prompt(roster: str, notes: str):
     )
 
 
+def _wait_for_background_interaction(client, interaction, label="Gemini analysis", max_wait_seconds=3600):
+    """Poll a Gemini background interaction without holding one long API request open."""
+    started = time.time()
+    progress = st.progress(0, text=f"{label} started in Gemini…")
+    interaction_id = getattr(interaction, "id", None)
+    if not interaction_id:
+        raise RuntimeError("Gemini did not return a background interaction ID.")
+
+    last_status = None
+    while True:
+        elapsed = int(time.time() - started)
+        if elapsed > max_wait_seconds:
+            raise TimeoutError(
+                f"Gemini analysis is still running after {max_wait_seconds // 60} minutes. "
+                f"The background job may continue on Google's servers (interaction {interaction_id})."
+            )
+
+        current = client.interactions.get(interaction_id)
+        status = getattr(current, "status", None)
+        if status != last_status:
+            progress.progress(
+                min(95, max(5, int((elapsed / max_wait_seconds) * 90))),
+                text=f"{label} — Gemini status: {status or 'in progress'}…",
+            )
+            last_status = status
+
+        if status == "completed":
+            output_text = getattr(current, "output_text", None)
+            if not output_text:
+                raise RuntimeError("Gemini completed the background job but returned no analysis text.")
+            progress.progress(100, text="Analysis complete")
+            return extract_json(output_text)
+
+        if status in {"failed", "cancelled"}:
+            error = getattr(current, "error", None)
+            raise RuntimeError(f"Gemini background analysis {status}: {error or 'no error details returned'}")
+
+        time.sleep(5)
+
+
 def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
     api_key = get_api_key()
     validate_api_key_format(api_key)
 
-    # Gemini's current Interactions API accepts public YouTube URLs directly,
-    # so the match does not need to be downloaded through Streamlit first.
+    # Long football matches can exceed the normal synchronous HTTP deadline.
+    # Gemini's current Interactions API supports background execution and agentic
+    # video processing, which is specifically intended for long-form video.
     client = genai.Client(api_key=api_key)
     prompt = build_prompt(roster, notes)
-    response = client.interactions.create(
+    interaction = client.interactions.create(
         model=model_name,
         input=[
             {"type": "text", "text": prompt},
-            {"type": "video", "uri": url.strip()},
+            {
+                "type": "video",
+                "uri": url.strip(),
+                "processing": "agentic",
+            },
         ],
+        background=True,
     )
-    output_text = getattr(response, "output_text", None)
-    if not output_text:
-        raise RuntimeError("Gemini returned no analysis text for the YouTube video.")
-    return extract_json(output_text)
+    return _wait_for_background_interaction(client, interaction, label="YouTube match analysis")
 
 
 def analyse_video(path: str, roster: str, notes: str, model_name: str):
@@ -194,18 +237,24 @@ def analyse_video(path: str, roster: str, notes: str, model_name: str):
         raise RuntimeError("Gemini could not process the uploaded video.")
 
     prompt = build_prompt(roster, notes)
-    progress.progress(35, text="Analysing match footage…")
+    progress.progress(35, text="Starting long-video analysis…")
 
-    response = client.models.generate_content(
+    # Use the same Interactions API/background/agentic path for uploaded long-form
+    # matches. This avoids a single long synchronous GenerateContent request.
+    interaction = client.interactions.create(
         model=model_name,
-        contents=[uploaded, types.Part.from_text(text=prompt)],
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
+        input=[
+            {
+                "type": "video",
+                "uri": uploaded.uri,
+                "mime_type": uploaded.mime_type,
+                "processing": "agentic",
+            },
+            {"type": "text", "text": prompt},
+        ],
+        background=True,
     )
-    progress.progress(100, text="Analysis complete")
-    return extract_json(response.text)
+    return _wait_for_background_interaction(client, interaction, label="Uploaded match analysis")
 
 
 def rating_label(r):
