@@ -18,3 +18,6 @@ GEMINI_API_KEY = "AQ.your-key-here"
 ```
 
 Keep the real key private and never commit it to GitHub.
+
+### v5 YouTube fix
+YouTube analysis uses the current documented Interactions API YouTube input shape without the `processing` field. Agentic processing remains enabled for uploaded/File API videos, where Google documents that option. Background execution and automatic retry/backoff remain enabled.

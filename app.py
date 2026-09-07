@@ -360,12 +360,18 @@ def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
         return _analyse_with_model_fallback(
             api_key,
             lambda: [
+                # For YouTube URLs, use the documented YouTube input shape.
+                # Agentic processing is supported for uploaded/File API video;
+                # the current YouTube example does not accept the processing
+                # field, which can cause HTTP 400 invalid_request errors.
+                {
+                    "type": "text",
+                    "text": prompt,
+                },
                 {
                     "type": "video",
                     "uri": url.strip(),
-                    "processing": "agentic",
                 },
-                {"type": "text", "text": prompt},
             ],
             model_name,
         )
