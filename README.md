@@ -1,23 +1,23 @@
-# Bishopton FC Video Analyst
+# Bishopton Football Analyst – YouTube Streaming Fix v6
 
-Streamlit app for AI-assisted youth football match analysis using Gemini video understanding.
+Streamlit app for youth football match analysis using the Gemini Interactions API.
 
-## Current long-video approach
-- Gemini 3.8 Flash is the default model.
-- Uses the Interactions API with background execution for long-running analysis.
-- Uses agentic video processing for long-form matches.
-- Automatically retries temporary 429/5xx/high-demand failures with exponential backoff.
-- Automatically falls back from Gemini 3.8 Flash to Gemini 3.7 Flash if a background job reports high demand.
-- Supports public YouTube URLs and local video uploads up to the app's configured upload limit.
+## v6 YouTube architecture
+
+- Gemini 3.8 Flash by default
+- YouTube URL is sent as a video input with `processing: "agentic"`
+- Video input is placed before the text prompt, matching the current Gemini video guidance
+- Uses `stream=True` for long YouTube matches instead of background polling
+- Displays processing/agentic progress while Gemini explores the match
+- Retries temporary/high-demand failures and can fall back to Gemini 3.7 Flash
+- Uploaded videos continue to use the File API + agentic processing + background execution
+
+Google's current video documentation recommends streaming or background execution for long/complex video requests, and specifically documents agentic video processing for Gemini 3.8 Flash.
 
 ## Streamlit Secrets
-Add this to Streamlit Cloud App Settings > Secrets:
 
-```toml
-GEMINI_API_KEY = "AQ.your-key-here"
-```
+Add one line in Streamlit Community Cloud Secrets:
 
-Keep the real key private and never commit it to GitHub.
+`GEMINI_API_KEY = "AQ.your-key-here"`
 
-### v5 YouTube fix
-YouTube analysis uses the current documented Interactions API YouTube input shape without the `processing` field. Agentic processing remains enabled for uploaded/File API videos, where Google documents that option. Background execution and automatic retry/backoff remain enabled.
+Do not commit API keys to GitHub.

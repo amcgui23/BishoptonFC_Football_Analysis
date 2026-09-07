@@ -352,32 +352,108 @@ def _analyse_with_model_fallback(api_key, inputs_factory, preferred_model):
             raise
     raise last_error or RuntimeError("No Gemini model was available for the analysis.")
 
+def _analyse_youtube_streaming(api_key, model_name, url, prompt):
+    """Run a long YouTube analysis as a live Interactions API stream.
+
+    Google recommends streaming for long/complex video requests because the open
+    connection can surface intermediate processing steps and avoid the timeout
+    behaviour seen with a single synchronous request. The current video docs
+    also recommend putting the video before the text prompt when combining them.
+    """
+    client = genai.Client(api_key=api_key)
+    stream = client.interactions.create(
+        model=model_name,
+        input=[
+            {
+                "type": "video",
+                "uri": url.strip(),
+                "processing": "agentic",
+            },
+            {"type": "text", "text": prompt},
+        ],
+        stream=True,
+    )
+
+    progress = st.progress(5, text=f"{model_name}: connected to Gemini…")
+    text_chunks = []
+    event_count = 0
+    last_step = ""
+
+    for event in stream:
+        event_count += 1
+        event_type = getattr(event, "event_type", "")
+        if event_type == "step.start":
+            step = getattr(event, "step", None)
+            step_type = getattr(step, "type", "") if step else ""
+            last_step = step_type or "processing"
+            labels = {
+                "thought": "Gemini is reasoning about the match…",
+                "processing_call": "Gemini is inspecting another part of the match…",
+                "processing_result": "Gemini received another video segment…",
+                "model_output": "Gemini is preparing the final football report…",
+            }
+            st.info(labels.get(step_type, f"Gemini step: {step_type or 'processing'}…"))
+            progress.progress(min(90, 10 + (event_count % 80)), text=labels.get(step_type, "Gemini is processing the match…"))
+        elif event_type == "step.delta":
+            delta = getattr(event, "delta", None)
+            delta_type = getattr(delta, "type", "") if delta else ""
+            if delta_type == "text":
+                chunk = getattr(delta, "text", None)
+                if chunk:
+                    text_chunks.append(chunk)
+                    progress.progress(95, text="Gemini is writing the final report…")
+        elif event_type == "interaction.completed":
+            progress.progress(100, text="Gemini analysis complete")
+            interaction = getattr(event, "interaction", None)
+            if interaction is not None:
+                try:
+                    output_text = interaction.output_text
+                except Exception:
+                    output_text = ""
+                if output_text:
+                    return extract_json(output_text)
+            break
+        elif event_type == "error":
+            error = getattr(event, "error", None)
+            message = getattr(error, "message", None) if error else None
+            code = getattr(error, "code", None) if error else None
+            raise RuntimeError(f"Gemini streaming error {code or ''}: {message or error or 'unknown error'}")
+
+    if text_chunks:
+        return extract_json("".join(text_chunks))
+    raise RuntimeError("Gemini streaming ended without a model report.")
+
+
 def analyse_youtube(url: str, roster: str, notes: str, model_name: str):
     api_key = get_api_key()
     validate_api_key_format(api_key)
     prompt = build_prompt(roster, notes)
-    try:
-        return _analyse_with_model_fallback(
-            api_key,
-            lambda: [
-                # For YouTube URLs, use the documented YouTube input shape.
-                # Agentic processing is supported for uploaded/File API video;
-                # the current YouTube example does not accept the processing
-                # field, which can cause HTTP 400 invalid_request errors.
-                {
-                    "type": "text",
-                    "text": prompt,
-                },
-                {
-                    "type": "video",
-                    "uri": url.strip(),
-                },
-            ],
-            model_name,
-        )
-    except Exception as exc:
-        raise RuntimeError(f"YouTube analysis failed: {exc}") from exc
+    models = []
+    for model in [model_name, *FALLBACK_MODELS]:
+        if model and model not in models:
+            models.append(model)
 
+    last_error = None
+    for index, model in enumerate(models):
+        for attempt in range(MAX_CREATE_RETRIES):
+            try:
+                st.caption(f"Gemini model: {model} · live streaming video analysis")
+                return _analyse_youtube_streaming(api_key, model, url, prompt)
+            except Exception as exc:
+                last_error = exc
+                msg = str(exc)
+                if not _is_retryable_http(503 if "high demand" in msg.lower() else 500, msg) or attempt == MAX_CREATE_RETRIES - 1:
+                    break
+                wait = _backoff(attempt)
+                st.warning(f"Gemini is temporarily busy. Retrying in {wait}s…")
+                time.sleep(wait)
+        if index < len(models) - 1 and last_error and "high demand" in str(last_error).lower():
+            st.warning(f"{model} remains busy. Trying {models[index + 1]} automatically…")
+            continue
+        if last_error:
+            break
+
+    raise RuntimeError(f"YouTube analysis failed: {last_error}")
 
 def analyse_video(path: str, roster: str, notes: str, model_name: str):
     api_key = get_api_key()
@@ -461,7 +537,7 @@ st.caption("AI-assisted match review for grassroots coaching — designed to wor
 
 with st.sidebar:
     st.header("Match setup")
-    model_name = st.text_input("Gemini model", value=MODEL_NAME, help="Default is Gemini 3.8 Flash. If it is temporarily busy, the app automatically retries and can fall back to Gemini 3.7 Flash.")
+    model_name = st.text_input("Gemini model", value=MODEL_NAME, help="Default is Gemini 3.8 Flash. YouTube uses live streaming + agentic video processing; temporary capacity errors are retried automatically.")
     roster = st.text_area(
         "Optional squad / roster",
         height=180,
@@ -474,7 +550,7 @@ with st.sidebar:
         placeholder="Example: assess build-up from the goalkeeper, pressing after losing the ball, and midfield spacing.",
     )
     st.info("For best results, provide shirt numbers and upload the clearest match footage available.")
-    st.caption("Gemini API keys created in AI Studio may begin with AQ. — that is supported. Long-video analysis uses agentic processing with automatic retry/backoff and a 3.7 Flash fallback.")
+    st.caption("Gemini API keys created in AI Studio may begin with AQ. — that is supported. YouTube long-video analysis uses live streaming + agentic processing with automatic retry/backoff.")
 
 st.subheader("Choose your video source")
 source = st.radio(
@@ -490,7 +566,7 @@ if source == "YouTube link":
         placeholder="https://www.youtube.com/watch?v=...",
         help="Use a public YouTube video. Private and unlisted videos cannot be analysed by Gemini's YouTube input.",
     )
-    st.info("💡 For a large full-match recording, YouTube is often the easiest option because the video does not need to be uploaded through this app.")
+    st.info("💡 For a large full-match recording, YouTube is often the easiest option. The app now uses Gemini live streaming + agentic video processing for long YouTube matches, which avoids the previous background-polling timeout/400 path.")
 
     if youtube_url:
         is_youtube = bool(re.match(r"^https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[^\s&]+", youtube_url.strip(), re.IGNORECASE))
