@@ -1,0 +1,43 @@
+# Bishopton FC Football Video Analyst
+
+An iPad-friendly Streamlit application for AI-assisted football match analysis using Google's Gemini video understanding.
+
+## What it does
+
+- Upload MP4/MOV/M4V/AVI/WebM match footage from an iPad or computer.
+- Optionally provide a squad roster with shirt numbers.
+- Ask the AI to focus on specific coaching themes.
+- Produce a match report, tactical observations, player reviews, key moments and cautiously estimated statistics.
+- Download the structured analysis as JSON.
+
+## Deploy with Streamlit Community Cloud
+
+1. Create a GitHub repository and upload this folder.
+2. Go to Streamlit Community Cloud and connect GitHub.
+3. Create an app using `app.py` as the entrypoint.
+4. In the app's Advanced settings / Secrets, add:
+
+```toml
+GEMINI_API_KEY = "your-key-here"
+```
+
+5. Deploy.
+
+The API key is deliberately not stored in the repository.
+
+## Local use
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+Then set `GEMINI_API_KEY` in the environment or `.streamlit/secrets.toml`.
+
+## Important limitations
+
+AI video analysis can miss players, actions or exact counts, especially when footage is distant, obstructed, low resolution or filmed from one angle. The app therefore tells Gemini not to invent statistics or player identities.
+
+Large match files can be expensive and slow to process. Gemini's File API is designed for large video inputs, but the Streamlit uploader is configured here for 500 MB. For larger files, split the match into halves or export a lower-bitrate MP4.
+
+The default model is `gemini-3.7-flash`; it can be changed in the sidebar or with `GEMINI_MODEL`.
