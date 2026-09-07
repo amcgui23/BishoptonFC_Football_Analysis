@@ -12,6 +12,8 @@ from google.genai import types
 st.set_page_config(page_title="Bishopton FC Video Analyst", page_icon="⚽", layout="wide")
 
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+MAX_UPLOAD_MB = 3072
+MAX_GEMINI_MB = 2048
 
 PROMPT = r'''
 You are a football analyst reviewing a youth football match video for a grassroots coaching team.
@@ -206,16 +208,22 @@ with st.sidebar:
 uploaded_file = st.file_uploader(
     "Upload your match video",
     type=["mp4", "mov", "m4v", "avi", "webm"],
-    max_upload_size=500,
-    help="For very long/high-resolution matches, export a smaller MP4 or split the match into halves/clips.",
+    max_upload_size=3072,
+    help="Uploads up to 3 GB are accepted by the app. Gemini File API currently supports up to 2 GB per file, so files above 2 GB will be rejected with a clear message.",
 )
 
 if uploaded_file:
     st.video(uploaded_file)
     size_mb = uploaded_file.size / (1024 * 1024)
     st.caption(f"{uploaded_file.name} · {size_mb:.1f} MB")
+    if size_mb > MAX_GEMINI_MB:
+        st.warning(
+            f"This video is {size_mb/1024:.2f} GB. The app accepts files up to 3 GB, "
+            "but Gemini's File API currently limits an individual file to 2 GB. "
+            "Please export/compress the video to 2 GB or less before analysing it."
+        )
 
-    if st.button("🔎 Analyse Match", type="primary", use_container_width=True):
+    if st.button("🔎 Analyse Match", type="primary", use_container_width=True, disabled=size_mb > MAX_GEMINI_MB):
         suffix = Path(uploaded_file.name).suffix.lower() or ".mp4"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(uploaded_file.getbuffer())

@@ -41,3 +41,8 @@ AI video analysis can miss players, actions or exact counts, especially when foo
 Large match files can be expensive and slow to process. Gemini's File API is designed for large video inputs, but the Streamlit uploader is configured here for 500 MB. For larger files, split the match into halves or export a lower-bitrate MP4.
 
 The default model is `gemini-3.7-flash`; it can be changed in the sidebar or with `GEMINI_MODEL`.
+
+
+## Large video uploads
+
+This version accepts uploads up to **3 GB** in Streamlit, providing some headroom for large match recordings. However, the Gemini File API currently supports a maximum of **2 GB per individual file**. Videos larger than 2 GB are therefore accepted by the uploader but blocked from analysis with an explanatory message. For a 2 GB-or-less recording, the app uploads it to Gemini using the File API, which Google recommends for large/long videos.
